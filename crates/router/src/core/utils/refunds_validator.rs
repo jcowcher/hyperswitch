@@ -94,7 +94,7 @@ pub fn validate_maximum_refund_against_payment_attempt(
     all_refunds: &[diesel_refund::Refund],
     refund_max_attempts: usize,
 ) -> CustomResult<(), RefundValidationError> {
-    utils::when(all_refunds.len() > refund_max_attempts, || {
+    utils::when(all_refunds.len() >= refund_max_attempts, || {
         Err(report!(RefundValidationError::MaxRefundCountReached))
     })
 }
@@ -297,5 +297,74 @@ pub fn validate_xendit_charge_refund(
             }
             Ok(Some(xendit_split_refund_request.for_user_id.clone()))
         }
+    }
+}
+
+#[cfg(all(test, feature = "v1"))]
+mod tests {
+    use common_utils::{id_type, types::MinorUnit};
+
+    use super::*;
+
+    fn refunds(count: usize) -> Vec<diesel_refund::Refund> {
+        let now = common_utils::date_time::now();
+        (0..count)
+            .map(|i| diesel_refund::Refund {
+                internal_reference_id: format!("internal_ref_{i}"),
+                refund_id: format!("refund_{i}"),
+                payment_id: id_type::PaymentId::default(),
+                merchant_id: id_type::MerchantId::default(),
+                connector_transaction_id: "txn_1".to_string().into(),
+                connector: "dummy".to_string(),
+                connector_refund_id: None,
+                external_reference_id: None,
+                refund_type: enums::RefundType::InstantRefund,
+                total_amount: MinorUnit::new(1200),
+                currency: enums::Currency::USD,
+                refund_amount: MinorUnit::new(100),
+                refund_status: enums::RefundStatus::Success,
+                sent_to_gateway: true,
+                refund_error_message: None,
+                metadata: None,
+                refund_arn: None,
+                created_at: now,
+                modified_at: now,
+                description: None,
+                attempt_id: "attempt_1".to_string(),
+                refund_reason: None,
+                refund_error_code: None,
+                profile_id: None,
+                updated_by: "test".to_string(),
+                merchant_connector_id: None,
+                charges: None,
+                organization_id: id_type::OrganizationId::default(),
+                connector_refund_data: None,
+                connector_transaction_data: None,
+                split_refunds: None,
+                unified_code: None,
+                unified_message: None,
+                processor_refund_data: None,
+                processor_transaction_data: None,
+                issuer_error_code: None,
+                issuer_error_message: None,
+                processor_merchant_id: None,
+                created_by: None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rejects_refund_when_max_attempts_refunds_already_exist() {
+        let result = validate_maximum_refund_against_payment_attempt(&refunds(10), 10);
+        assert!(matches!(
+            result.as_ref().map_err(|err| err.current_context()),
+            Err(RefundValidationError::MaxRefundCountReached)
+        ));
+    }
+
+    #[test]
+    fn allows_refund_when_below_max_attempts() {
+        let result = validate_maximum_refund_against_payment_attempt(&refunds(9), 10);
+        assert!(result.is_ok());
     }
 }
