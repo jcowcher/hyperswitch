@@ -55,7 +55,7 @@ use rand::SeedableRng;
 #[cfg(all(feature = "v1", feature = "dynamic_routing"))]
 use router_env::{instrument, tracing};
 use rustc_hash::FxHashMap;
-use storage_impl::redis::cache::{CacheKey, CGRAPH_CACHE, ROUTING_CACHE};
+use storage_impl::redis::cache::CacheKey;
 
 #[cfg(feature = "v2")]
 use crate::core::admin;
@@ -2014,7 +2014,10 @@ pub async fn ensure_algorithm_cached_v1(
         }
     };
 
-    let cached_algorithm = ROUTING_CACHE
+    let cached_algorithm = state
+        .store
+        .caches()
+        .routing
         .get_val::<Arc<CachedAlgorithm>>(CacheKey {
             key: key.clone(),
             prefix: state.tenant.redis_key_prefix.clone(),
@@ -2161,7 +2164,10 @@ pub async fn refresh_routing_cache_v1(
 
     let arc_cached_algorithm = Arc::new(cached_algorithm);
 
-    ROUTING_CACHE
+    state
+        .store
+        .caches()
+        .routing
         .push(
             CacheKey {
                 key,
@@ -2281,7 +2287,10 @@ pub async fn get_merchant_cgraph(
         }
     };
 
-    let cached_cgraph = CGRAPH_CACHE
+    let cached_cgraph = state
+        .store
+        .caches()
+        .cgraph
         .get_val::<Arc<hyperswitch_constraint_graph::ConstraintGraph<euclid_dir::DirValue>>>(
             CacheKey {
                 key: key.clone(),
@@ -2392,7 +2401,10 @@ pub async fn refresh_cgraph_cache(
             .attach_printable("when construction cgraph")?,
     );
 
-    CGRAPH_CACHE
+    state
+        .store
+        .caches()
+        .cgraph
         .push(
             CacheKey {
                 key,
