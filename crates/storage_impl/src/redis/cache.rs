@@ -1,8 +1,9 @@
 use std::{
     any::Any,
     borrow::Cow,
+    collections::HashMap,
     fmt::Debug,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Mutex, PoisonError},
 };
 
 use common_utils::{
@@ -202,7 +203,53 @@ dyn_clone::clone_trait_object!(Cacheable);
 pub struct Cache {
     name: &'static str,
     inner: MokaCache<String, Arc<dyn Cacheable>>,
+    loads_in_flight: KeyedLocks,
 }
+
+/// Per-key async locks used to let only one caller at a time run the fallback for a
+/// missing cache key. Entries are removed once no caller holds or awaits them.
+#[derive(Default)]
+struct KeyedLocks(Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>);
+
+impl KeyedLocks {
+    async fn lock(&self, key: String) -> KeyedLockGuard<'_> {
+        let lock = Arc::clone(
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(key.clone())
+                .or_default(),
+        );
+        KeyedLockGuard {
+            locks: self,
+            key,
+            guard: Some(lock.lock_owned().await),
+        }
+    }
+}
+
+struct KeyedLockGuard<'a> {
+    locks: &'a KeyedLocks,
+    key: String,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for KeyedLockGuard<'_> {
+    fn drop(&mut self) {
+        let mut locks = self.locks.0.lock().unwrap_or_else(PoisonError::into_inner);
+        // One reference is held by the map and one by this guard; any more belong to
+        // callers still waiting on this key.
+        if locks
+            .get(&self.key)
+            .is_some_and(|lock| Arc::strong_count(lock) <= 2)
+        {
+            locks.remove(&self.key);
+        }
+        self.guard.take();
+    }
+}
+
+static REDIS_LOADS_IN_FLIGHT: LazyLock<KeyedLocks> = LazyLock::new(KeyedLocks::default);
 
 #[derive(Debug, Clone)]
 pub struct CacheKey {
@@ -279,6 +326,7 @@ impl Cache {
         Self {
             name,
             inner: cache_builder.build(),
+            loads_in_flight: KeyedLocks::default(),
         }
     }
 
@@ -413,33 +461,43 @@ where
 {
     let type_name = std::any::type_name::<T>();
     let key = key.as_ref();
-    let redis_val = redis
-        .get_and_deserialize_key::<T>(&key.into(), type_name)
-        .await;
-    let get_data_set_redis = || async {
-        let data = fun().await?;
-        match ttl {
-            Some(ttl) => {
-                redis
-                    .serialize_and_set_key_with_expiry(&key.into(), &data, ttl)
-                    .await
-            }
-            None => redis.serialize_and_set_key(&key.into(), &data).await,
+    let get_from_redis = || async {
+        match redis
+            .get_and_deserialize_key::<T>(&key.into(), type_name)
+            .await
+        {
+            Ok(val) => Ok(Some(val)),
+            Err(err) => match err.current_context() {
+                RedisError::NotFound | RedisError::JsonDeserializationFailed => Ok(None),
+                _ => Err(err
+                    .change_context(StorageError::KVError)
+                    .attach_printable(format!("Error while fetching cache for {type_name}"))),
+            },
         }
-        .change_context(StorageError::KVError)?;
-        Ok::<_, Report<StorageError>>(data)
     };
-    match redis_val {
-        Err(err) => match err.current_context() {
-            RedisError::NotFound | RedisError::JsonDeserializationFailed => {
-                get_data_set_redis().await
-            }
-            _ => Err(err
-                .change_context(StorageError::KVError)
-                .attach_printable(format!("Error while fetching cache for {type_name}"))),
-        },
-        Ok(val) => Ok(val),
+
+    if let Some(val) = get_from_redis().await? {
+        return Ok(val);
     }
+
+    let _load_guard = REDIS_LOADS_IN_FLIGHT
+        .lock(redis.redis_conn.add_prefix(key))
+        .await;
+    if let Some(val) = get_from_redis().await? {
+        return Ok(val);
+    }
+
+    let data = fun().await?;
+    match ttl {
+        Some(ttl) => {
+            redis
+                .serialize_and_set_key_with_expiry(&key.into(), &data, ttl)
+                .await
+        }
+        None => redis.serialize_and_set_key(&key.into(), &data).await,
+    }
+    .change_context(StorageError::KVError)?;
+    Ok(data)
 }
 
 /// Recorded args for the [`Cache`] boundaries: cache name + un-namespaced
@@ -471,22 +529,21 @@ where
         key: key.to_string(),
         prefix: redis.redis_conn.key_prefix.clone(),
     };
-    let cache_val = cache.get_val::<T>(cache_key).await;
-    if let Some(val) = cache_val {
-        Ok(val)
-    } else {
-        let val = get_or_populate_redis(redis, key, None, fun).await?;
-        cache
-            .push(
-                CacheKey {
-                    key: key.to_string(),
-                    prefix: redis.redis_conn.key_prefix.clone(),
-                },
-                val.clone(),
-            )
-            .await;
-        Ok(val)
+    if let Some(val) = cache.get_val::<T>(cache_key.clone()).await {
+        return Ok(val);
     }
+
+    let _load_guard = cache
+        .loads_in_flight
+        .lock(in_memory_cache_key(cache_key.clone()))
+        .await;
+    if let Some(val) = cache.get_val::<T>(cache_key.clone()).await {
+        return Ok(val);
+    }
+
+    let val = get_or_populate_redis(redis, key, None, fun).await?;
+    cache.push(cache_key, val.clone()).await;
+    Ok(val)
 }
 
 #[instrument(skip_all)]
@@ -670,5 +727,201 @@ mod cache_tests {
                 .await,
             None
         );
+    }
+
+    const CONCURRENT_REQUESTS: usize = 100;
+
+    struct TestRedisStore(Arc<redis_interface::RedisConnectionPool>);
+
+    impl RedisConnInterface for TestRedisStore {
+        fn get_redis_conn(&self) -> Result<RedisConnectionWithContext, Report<RedisError>> {
+            Ok(RedisConnectionWithContext::new_without_context(
+                self.0.clone(),
+            ))
+        }
+    }
+
+    async fn test_redis_pool() -> Arc<redis_interface::RedisConnectionPool> {
+        Arc::new(
+            redis_interface::RedisConnectionPool::new_without_event_emitter(
+                &redis_interface::RedisSettings::default(),
+            )
+            .await
+            .expect("failed to connect to redis at 127.0.0.1:6379"),
+        )
+    }
+
+    fn unique_key(name: &str) -> String {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let counter = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pid = common_utils::process_id();
+        let millis = common_utils::date_time::now_unix_timestamp_millis();
+        format!("cache_stampede_test:{name}:{pid}_{millis}_{counter}")
+    }
+
+    async fn counting_fallback(
+        counter: Arc<std::sync::atomic::AtomicUsize>,
+        value: String,
+    ) -> CustomResult<String, StorageError> {
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        Ok(value)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_redis_misses_run_fallback_once() {
+        let redis = Arc::new(RedisConnectionWithContext::new_without_context(
+            test_redis_pool().await,
+        ));
+        let key = unique_key("redis_same_key");
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENT_REQUESTS));
+
+        let handles = (0..CONCURRENT_REQUESTS)
+            .map(|_| {
+                let (redis, key, executions, barrier) = (
+                    redis.clone(),
+                    key.clone(),
+                    executions.clone(),
+                    barrier.clone(),
+                );
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    get_or_populate_redis(&redis, &key, Some(60), || {
+                        counting_fallback(executions, "value".to_string())
+                    })
+                    .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in futures::future::join_all(handles).await {
+            assert_eq!(
+                handle.expect("task panicked").expect("lookup failed"),
+                "value"
+            );
+        }
+
+        let executions = executions.load(std::sync::atomic::Ordering::SeqCst);
+        println!("Concurrent Redis requests: {CONCURRENT_REQUESTS}");
+        println!("Fallback executions: {executions}");
+        let _ = redis.delete_key(&key.as_str().into()).await;
+        assert_eq!(executions, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_redis_misses_for_different_keys_load_independently() {
+        let redis = Arc::new(RedisConnectionWithContext::new_without_context(
+            test_redis_pool().await,
+        ));
+        let keys = (0..CONCURRENT_REQUESTS)
+            .map(|i| unique_key(&format!("redis_distinct_key_{i}")))
+            .collect::<Vec<_>>();
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENT_REQUESTS));
+
+        let started = std::time::Instant::now();
+        let handles = keys
+            .iter()
+            .cloned()
+            .map(|key| {
+                let (redis, executions, barrier) =
+                    (redis.clone(), executions.clone(), barrier.clone());
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    get_or_populate_redis(&redis, &key, Some(60), || {
+                        counting_fallback(executions, key.clone())
+                    })
+                    .await
+                    .map(|val| (key, val))
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in futures::future::join_all(handles).await {
+            let (key, val) = handle.expect("task panicked").expect("lookup failed");
+            assert_eq!(key, val);
+        }
+        let elapsed = started.elapsed();
+
+        for key in &keys {
+            let _ = redis.delete_key(&key.as_str().into()).await;
+        }
+        assert_eq!(
+            executions.load(std::sync::atomic::Ordering::SeqCst),
+            CONCURRENT_REQUESTS
+        );
+        // Distinct keys must not be serialised behind one another: 100 sequential
+        // 50ms fallbacks would take at least 5s.
+        assert!(elapsed < std::time::Duration::from_secs(2), "{elapsed:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_redis_misses_through_in_memory_cache_run_fallback_once() {
+        let pool = test_redis_pool().await;
+        let store = Arc::new(TestRedisStore(pool.clone()));
+        let cache = Arc::new(Cache::new("test", 1800, 1800, None));
+        let key = unique_key("in_memory_same_key");
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(CONCURRENT_REQUESTS));
+
+        let handles = (0..CONCURRENT_REQUESTS)
+            .map(|_| {
+                let (store, cache, key, executions, barrier) = (
+                    store.clone(),
+                    cache.clone(),
+                    key.clone(),
+                    executions.clone(),
+                    barrier.clone(),
+                );
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    get_or_populate_in_memory(
+                        store.as_ref(),
+                        &key,
+                        || counting_fallback(executions, "value".to_string()),
+                        &cache,
+                    )
+                    .await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in futures::future::join_all(handles).await {
+            assert_eq!(
+                handle.expect("task panicked").expect("lookup failed"),
+                "value"
+            );
+        }
+
+        let executions = executions.load(std::sync::atomic::Ordering::SeqCst);
+        println!("Concurrent in-memory requests: {CONCURRENT_REQUESTS}");
+        println!("Fallback executions: {executions}");
+        let _ = RedisConnectionWithContext::new_without_context(pool)
+            .delete_key(&key.as_str().into())
+            .await;
+        assert_eq!(executions, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_redis_miss_fallback_error_is_not_cached() {
+        let redis = RedisConnectionWithContext::new_without_context(test_redis_pool().await);
+        let key = unique_key("redis_fallback_error");
+
+        let failed = get_or_populate_redis(&redis, &key, Some(60), || async {
+            Err::<String, _>(Report::new(StorageError::ValueNotFound("x".to_string())))
+        })
+        .await;
+        assert!(failed.is_err());
+
+        let executions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let val = get_or_populate_redis(&redis, &key, Some(60), || {
+            counting_fallback(executions.clone(), "value".to_string())
+        })
+        .await
+        .expect("lookup failed");
+        let _ = redis.delete_key(&key.as_str().into()).await;
+        assert_eq!(val, "value");
+        assert_eq!(executions.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
