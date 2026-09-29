@@ -2085,6 +2085,28 @@ impl super::RedisConnectionWithContext {
         .change_context(errors::RedisError::ConsumerGroupRemoveConsumerFailed)
     }
 
+    /// Delete consumers of `group`, other than `keep_consumer`, that have no pending entries and
+    /// have been idle for at least `min_idle_time` milliseconds. Returns the number deleted.
+    #[instrument(level = "DEBUG", skip(self))]
+    pub async fn consumer_group_delete_idle_consumers(
+        &self,
+        stream: &RedisKey,
+        group: &str,
+        keep_consumer: &str,
+        min_idle_time: u64,
+    ) -> CustomResult<usize, errors::RedisError> {
+        self.evaluate_redis_script(
+            crate::constant::DELETE_IDLE_CONSUMERS_SCRIPT,
+            vec![stream.tenant_aware_key(&self.redis_conn)],
+            vec![
+                group.to_string(),
+                keep_consumer.to_string(),
+                min_idle_time.to_string(),
+            ],
+        )
+        .await
+    }
+
     #[instrument(level = "DEBUG", skip(self))]
     #[cfg_attr(
         feature = "deja",
