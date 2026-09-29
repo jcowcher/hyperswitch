@@ -554,9 +554,11 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Ba
         req: &PaymentsCancelRouterData,
         connectors: &Connectors,
     ) -> CustomResult<String, errors::ConnectorError> {
+        // Bambora voids only purchases and returns; a pre-authorization is
+        // released by completing it for a zero amount.
         let connector_payment_id = req.request.connector_transaction_id.clone();
         Ok(format!(
-            "{}/v1/payments/{}/void",
+            "{}/v1/payments/{}/completions",
             self.base_url(connectors),
             connector_payment_id,
         ))
@@ -567,23 +569,7 @@ impl ConnectorIntegration<Void, PaymentsCancelData, PaymentsResponseData> for Ba
         req: &PaymentsCancelRouterData,
         _connectors: &Connectors,
     ) -> CustomResult<RequestContent, errors::ConnectorError> {
-        let currency =
-            req.request
-                .currency
-                .ok_or(errors::ConnectorError::MissingRequiredField {
-                    field_name: "Currency".into(),
-                })?;
-        let minor_amount =
-            req.request
-                .minor_amount
-                .ok_or(errors::ConnectorError::MissingRequiredField {
-                    field_name: "Amount".into(),
-                })?;
-
-        let amount = convert_amount(self.amount_convertor, minor_amount, currency)?;
-
-        let connector_router_data = BamboraRouterData::try_from((amount, req))?;
-        let connector_req = bambora::BamboraVoidRequest::try_from(connector_router_data)?;
+        let connector_req = bambora::BamboraVoidRequest::try_from(req)?;
         Ok(RequestContent::Json(Box::new(connector_req)))
     }
 
@@ -904,5 +890,44 @@ impl ConnectorSpecifications for Bambora {
 
     fn get_supported_webhook_flows(&self) -> Option<&'static [enums::EventClass]> {
         Some(&*BAMBORA_SUPPORTED_WEBHOOK_FLOWS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperswitch_domain_models::connector_endpoints::ConnectorParams;
+    use hyperswitch_masking::ExposeInterface;
+
+    use super::*;
+
+    fn connectors() -> Connectors {
+        Connectors {
+            bambora: ConnectorParams {
+                base_url: "https://api.na.bambora.com".to_string(),
+                secondary_base_url: None,
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn void_cancels_pre_authorization_with_zero_amount_completion() {
+        let req = bambora::tests::cancel_router_data();
+        let connectors = connectors();
+
+        let url = PaymentsVoidType::get_url(Bambora::new(), &req, &connectors).unwrap();
+        assert_eq!(
+            url,
+            "https://api.na.bambora.com/v1/payments/10013319/completions"
+        );
+
+        let body = PaymentsVoidType::get_request_body(Bambora::new(), &req, &connectors)
+            .unwrap()
+            .get_inner_value()
+            .expose();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"amount": 0.0, "payment_method": "card"})
+        );
     }
 }
