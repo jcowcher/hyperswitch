@@ -455,7 +455,7 @@ describe("Card - MultiUse Mandates flow test", () => {
         );
       });
 
-       it("retrieve-payment-call-test", () => {
+      it("retrieve-payment-call-test", () => {
         const data = getConnectorDetails(globalState.get("connectorId"))[
           "card_pm"
         ]["MITAutoCapture"];
@@ -477,7 +477,7 @@ describe("Card - MultiUse Mandates flow test", () => {
         );
       });
 
-       it("retrieve-payment-call-test", () => {
+      it("retrieve-payment-call-test", () => {
         const data = getConnectorDetails(globalState.get("connectorId"))[
           "card_pm"
         ]["MITAutoCapture"];
