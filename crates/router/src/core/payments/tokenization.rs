@@ -1465,7 +1465,9 @@ pub async fn save_in_locker_internal(
             ),
         )
         .await
-        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .change_context(errors::ApiErrorResponse::UnprocessableEntity {
+            message: "Unable to save the bank debit payment method".to_string(),
+        })
         .attach_printable("Add Bank Debit Failed"),
         (
             None,

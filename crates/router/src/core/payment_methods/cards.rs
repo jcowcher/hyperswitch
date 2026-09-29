@@ -786,6 +786,26 @@ impl PaymentMethodsController for PmCards<'_> {
                 .clone(),
         );
 
+        if self.state.conf.locker.mock_locker {
+            let enc_data =
+                encrypt_vaulting_data_for_mock_locker(self.state, key_store, &pmd).await?;
+            let payload =
+                payment_methods::StoreLockerReq::LockerGeneric(payment_methods::StoreGenericReq {
+                    merchant_id: self.provider.get_account().get_id().to_owned(),
+                    merchant_customer_id: customer_id.to_owned(),
+                    enc_data,
+                    ttl: self.state.conf.locker.ttl_for_storage_in_secs,
+                });
+            let store_resp = add_card_to_vault(self.state, &payload, customer_id).await?;
+            let payment_method_resp = payment_methods::mk_add_bank_debit_response_hs(
+                store_resp.card_reference,
+                req,
+                self.provider.get_account().get_id(),
+                generate_id(consts::ID_LENGTH, "fingerprint"),
+            );
+            return Ok((payment_method_resp, store_resp.duplication_check));
+        }
+
         let payload = encode_vault_fingerprint_request(
             should_trigger_fingerprint_migration,
             key_store.merchant_id.clone(),
@@ -3397,6 +3417,31 @@ pub async fn get_encrypted_data_from_vault<'a>(
             .payment_method_data
     };
     Ok(payment_method_data)
+}
+
+#[cfg(feature = "v1")]
+async fn encrypt_vaulting_data_for_mock_locker(
+    state: &routes::SessionState,
+    key_store: &domain::MerchantKeyStore,
+    payment_method_data: &hyperswitch_domain_models::vault::PaymentMethodVaultingData,
+) -> errors::CustomResult<String, errors::VaultError> {
+    let encoded = payment_method_data
+        .encode_to_string_of_json()
+        .change_context(errors::VaultError::RequestEncodingFailed)
+        .attach_printable("Failed to encode payment method vaulting data")?;
+    let secret: Secret<String> = Secret::new(encoded);
+    let encrypted = domain::types::crypto_operation(
+        &state.into(),
+        type_name!(payment_method::PaymentMethod),
+        domain::types::CryptoOperation::Encrypt(secret),
+        Identifier::Merchant(key_store.merchant_id.clone()),
+        key_store.key.get_inner().peek(),
+    )
+    .await
+    .and_then(|val| val.try_into_operation())
+    .change_context(errors::VaultError::SavePaymentMethodFailed)
+    .attach_printable("Failed to encrypt payment method vaulting data")?;
+    Ok(hex::encode(Encryption::from(encrypted).into_inner().peek()))
 }
 
 #[instrument(skip_all)]
@@ -7586,4 +7631,58 @@ pub async fn execute_payment_method_tokenization(
     let builder = builder.set_payment_method(&updated_payment_method);
 
     Ok(builder.build())
+}
+
+#[cfg(all(test, feature = "v1"))]
+mod mock_locker_tests {
+    use common_utils::{
+        generate_customer_id_of_default_length, id_type, types::keymanager::KeyManagerState,
+    };
+    use storage_impl::MockDb;
+
+    use super::*;
+    use crate::db::locker_mock_up::LockerMockUpInterface;
+
+    #[tokio::test]
+    async fn generic_payload_is_stored_in_mock_locker() {
+        let mockdb = MockDb::new(
+            &redis_interface::RedisSettings::default(),
+            KeyManagerState::mock(),
+        )
+        .await
+        .expect("Failed to create Mock store");
+        let customer_id = generate_customer_id_of_default_length();
+        let payload =
+            payment_methods::StoreLockerReq::LockerGeneric(payment_methods::StoreGenericReq {
+                merchant_id: id_type::MerchantId::default(),
+                merchant_customer_id: customer_id.clone(),
+                enc_data: "encrypted_bank_debit".to_string(),
+                ttl: 60,
+            });
+
+        let response = mock_call_to_locker_hs(
+            &mockdb,
+            "bank_debit_1",
+            &payload,
+            None,
+            None,
+            Some(&customer_id),
+        )
+        .await
+        .expect("mock locker should store the bank debit payload");
+
+        let card_reference = response
+            .payload
+            .expect("mock locker response should carry a payload")
+            .card_reference;
+        let stored = mockdb
+            .find_locker_by_card_id(&card_reference)
+            .await
+            .expect("stored entry should be retrievable");
+        assert_eq!(
+            stored.enc_card_data.as_deref(),
+            Some("encrypted_bank_debit")
+        );
+        assert_eq!(stored.customer_id, Some(customer_id));
+    }
 }
