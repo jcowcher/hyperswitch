@@ -93,6 +93,7 @@ pub struct BamboraPaymentsRequest {
 #[derive(Default, Debug, Serialize)]
 pub struct BamboraVoidRequest {
     amount: FloatMajorUnit,
+    payment_method: PaymentMethod,
 }
 
 fn get_browser_info(
@@ -239,13 +240,12 @@ impl TryFrom<BamboraRouterData<&types::PaymentsAuthorizeRouterData>> for Bambora
     }
 }
 
-impl TryFrom<BamboraRouterData<&types::PaymentsCancelRouterData>> for BamboraVoidRequest {
+impl TryFrom<&types::PaymentsCancelRouterData> for BamboraVoidRequest {
     type Error = error_stack::Report<errors::ConnectorError>;
-    fn try_from(
-        item: BamboraRouterData<&types::PaymentsCancelRouterData>,
-    ) -> Result<Self, Self::Error> {
+    fn try_from(_item: &types::PaymentsCancelRouterData) -> Result<Self, Self::Error> {
         Ok(Self {
-            amount: item.amount,
+            amount: FloatMajorUnit::zero(),
+            payment_method: PaymentMethod::Card,
         })
     }
 }
@@ -821,4 +821,146 @@ pub struct CardValidation {
     type_: String,
     amount: f64,
     cvd_id: i32,
+}
+
+#[cfg(test)]
+pub(super) mod tests {
+    use std::marker::PhantomData;
+
+    use hyperswitch_domain_models::{
+        payment_address::PaymentAddress, router_data::ErrorResponse,
+        router_flow_types::payments::Void, router_request_types::PaymentsCancelData,
+    };
+
+    use super::*;
+
+    pub(in crate::connectors::bambora) fn cancel_router_data() -> types::PaymentsCancelRouterData {
+        RouterData {
+            flow: PhantomData::<Void>,
+            merchant_id: common_utils::id_type::MerchantId::try_from(std::borrow::Cow::from(
+                "bambora",
+            ))
+            .unwrap(),
+            customer_id: None,
+            connector_customer: None,
+            connector: "bambora".to_string(),
+            payment_id: "pay_bambora_void".to_string(),
+            attempt_id: "pay_bambora_void_1".to_string(),
+            tenant_id: common_utils::id_type::TenantId::try_from_string("public".to_string())
+                .unwrap(),
+            status: enums::AttemptStatus::Authorized,
+            payment_method: enums::PaymentMethod::Card,
+            payment_method_type: None,
+            connector_auth_type: ConnectorAuthType::BodyKey {
+                api_key: Secret::new("api_key".to_string()),
+                key1: Secret::new("merchant_id".to_string()),
+            },
+            description: None,
+            address: PaymentAddress::default(),
+            auth_type: enums::AuthenticationType::NoThreeDs,
+            connector_meta_data: None,
+            connector_wallets_details: None,
+            amount_captured: None,
+            access_token: None,
+            session_token: None,
+            reference_id: None,
+            payment_method_token: None,
+            recurring_mandate_payment_data: None,
+            preprocessing_id: None,
+            payment_method_balance: None,
+            connector_api_version: None,
+            request: PaymentsCancelData {
+                amount: Some(6000),
+                currency: Some(enums::Currency::USD),
+                connector_transaction_id: "10013319".to_string(),
+                minor_amount: Some(common_utils::types::MinorUnit::new(6000)),
+                ..Default::default()
+            },
+            response: Err(ErrorResponse::default()),
+            connector_request_reference_id: "pay_bambora_void_1".to_string(),
+            #[cfg(feature = "payouts")]
+            payout_method_data: None,
+            #[cfg(feature = "payouts")]
+            quote_id: None,
+            test_mode: None,
+            connector_http_status_code: None,
+            external_latency: None,
+            apple_pay_flow: None,
+            frm_metadata: None,
+            dispute_id: None,
+            refund_id: None,
+            payout_id: None,
+            connector_response: None,
+            payment_method_status: None,
+            minor_amount_captured: None,
+            minor_amount_capturable: None,
+            authorized_amount: None,
+            integrity_check: Ok(()),
+            accept_amount_mismatch: None,
+            additional_merchant_data: None,
+            header_payload: None,
+            connector_mandate_request_reference_id: None,
+            l2_l3_data: None,
+            authentication_id: None,
+            psd2_sca_exemption_type: None,
+            raw_connector_response: None,
+            is_payment_id_from_merchant: None,
+            customer_document_details: None,
+            customer_date_of_birth: None,
+            feature_data: None,
+            sender_payment_instrument_id: None,
+            connector_returned_payment_method_details: None,
+        }
+    }
+
+    fn zero_amount_completion_response(approved: u8) -> BamboraPaymentsResponse {
+        serde_json::from_value(serde_json::json!({
+            "id": "10013320",
+            "authorizing_merchant_id": 300200578,
+            "approved": approved,
+            "message_id": if approved == 1 { 1 } else { 7 },
+            "message": if approved == 1 { "Approved" } else { "DECLINE" },
+            "auth_code": "TEST",
+            "created": "2026-09-28T10:00:00",
+            "amount": 0.0,
+            "order_number": "pay_bambora_void_1",
+            "type": "PAC",
+            "payment_method": "CC",
+            "card": {
+                "card_type": "VI",
+                "last_four": "1111",
+                "avs_result": "0",
+                "cvd_result": "5"
+            },
+            "custom": {"ref1": "", "ref2": "", "ref3": "", "ref4": "", "ref5": ""},
+            "links": []
+        }))
+        .unwrap()
+    }
+
+    fn void_status(response: BamboraPaymentsResponse) -> enums::AttemptStatus {
+        types::PaymentsCancelRouterData::try_from(PaymentsCancelResponseRouterData {
+            response,
+            data: cancel_router_data(),
+            http_code: 200,
+        })
+        .unwrap()
+        .status
+    }
+
+    #[test]
+    fn approved_zero_amount_completion_maps_void_to_voided() {
+        assert_eq!(
+            void_status(zero_amount_completion_response(1)),
+            enums::AttemptStatus::Voided
+        );
+    }
+
+    #[test]
+    fn declined_zero_amount_completion_maps_void_to_void_failed() {
+        assert_eq!(
+            void_status(zero_amount_completion_response(0)),
+            enums::AttemptStatus::VoidFailed
+        );
+    }
 }
