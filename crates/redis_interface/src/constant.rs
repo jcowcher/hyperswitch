@@ -24,3 +24,21 @@ pub mod redis_rs_commands {
     /// that never returns to 0. 1000 iterations × default COUNT(100) = ~100K entries.
     pub const MAX_SCAN_ITERATIONS: u32 = 1000;
 }
+
+/// Deletes every consumer of group `ARGV[1]` on stream `KEYS[1]`, other than `ARGV[2]`, that has
+/// no pending entries and has been idle for at least `ARGV[3]` milliseconds. Returns the number of
+/// consumers deleted. Runs as a script so no consumer can read between the check and the delete.
+pub const DELETE_IDLE_CONSUMERS_SCRIPT: &str = r#"
+local deleted = 0
+for _, consumer in ipairs(redis.call("XINFO", "CONSUMERS", KEYS[1], ARGV[1])) do
+    local info = {}
+    for i = 1, #consumer, 2 do
+        info[consumer[i]] = consumer[i + 1]
+    end
+    if info["name"] ~= ARGV[2] and info["pending"] == 0 and info["idle"] >= tonumber(ARGV[3]) then
+        redis.call("XGROUP", "DELCONSUMER", KEYS[1], ARGV[1], info["name"])
+        deleted = deleted + 1
+    end
+end
+return deleted
+"#;

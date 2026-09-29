@@ -1707,6 +1707,18 @@ impl QueueInterface for KafkaStore {
             .await
     }
 
+    async fn consumer_group_remove_idle_consumers(
+        &self,
+        stream: &str,
+        group: &str,
+        keep_consumer: &str,
+        min_idle_time: u64,
+    ) -> CustomResult<usize, RedisError> {
+        self.diesel_store
+            .consumer_group_remove_idle_consumers(stream, group, keep_consumer, min_idle_time)
+            .await
+    }
+
     async fn acquire_pt_lock(
         &self,
         tag: &str,

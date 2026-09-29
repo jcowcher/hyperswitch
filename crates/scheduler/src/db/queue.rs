@@ -29,6 +29,14 @@ pub trait QueueInterface {
         consumer: &str,
     ) -> CustomResult<(), RedisError>;
 
+    async fn consumer_group_remove_idle_consumers(
+        &self,
+        stream: &str,
+        group: &str,
+        keep_consumer: &str,
+        min_idle_time: u64,
+    ) -> CustomResult<usize, RedisError>;
+
     async fn acquire_pt_lock(
         &self,
         tag: &str,
@@ -91,6 +99,23 @@ impl QueueInterface for Store {
             .consumer_group_delete_consumer(&stream.into(), group, consumer)
             .await
             .map(|_pending_messages| ())
+    }
+
+    async fn consumer_group_remove_idle_consumers(
+        &self,
+        stream: &str,
+        group: &str,
+        keep_consumer: &str,
+        min_idle_time: u64,
+    ) -> CustomResult<usize, RedisError> {
+        self.get_redis_conn()?
+            .consumer_group_delete_idle_consumers(
+                &stream.into(),
+                group,
+                keep_consumer,
+                min_idle_time,
+            )
+            .await
     }
 
     async fn acquire_pt_lock(
@@ -183,6 +208,17 @@ impl QueueInterface for MockDb {
         _group: &str,
         _consumer: &str,
     ) -> CustomResult<(), RedisError> {
+        // [#172]: Implement function for `MockDb`
+        Err(RedisError::ConsumerGroupRemoveConsumerFailed)?
+    }
+
+    async fn consumer_group_remove_idle_consumers(
+        &self,
+        _stream: &str,
+        _group: &str,
+        _keep_consumer: &str,
+        _min_idle_time: u64,
+    ) -> CustomResult<usize, RedisError> {
         // [#172]: Implement function for `MockDb`
         Err(RedisError::ConsumerGroupRemoveConsumerFailed)?
     }

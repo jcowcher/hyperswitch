@@ -27,6 +27,9 @@ use crate::{
     metrics, utils as pt_utils, SchedulerAppState, SchedulerInterface, SchedulerSessionState,
 };
 
+/// Number of missed polls after which a consumer with no pending entries is considered dead.
+const IDLE_CONSUMER_THRESHOLD_POLLS: u64 = 12;
+
 // Valid consumer business statuses
 pub fn valid_business_statuses() -> Vec<&'static str> {
     vec![storage::business_status::PENDING]
@@ -182,6 +185,28 @@ pub async fn consumer_operations<T: SchedulerSessionState + 'static>(
         .get_db()
         .consumer_group_create(&stream_name, &group_name, &RedisEntryId::AfterLastID)
         .await;
+
+    // A consumer from a process that exited without its shutdown `XGROUP DELCONSUMER` (crash,
+    // SIGKILL) is never removed by Redis. Live consumers reset their idle time on every poll.
+    match state
+        .get_db()
+        .consumer_group_remove_idle_consumers(
+            &stream_name,
+            &group_name,
+            consumer_name,
+            settings
+                .loop_interval
+                .saturating_mul(IDLE_CONSUMER_THRESHOLD_POLLS),
+        )
+        .await
+    {
+        Ok(0) => (),
+        Ok(removed) => logger::info!(removed, "Removed idle consumers from consumer group"),
+        Err(error) => logger::error!(
+            ?error,
+            "Failed to remove idle consumers from consumer group"
+        ),
+    }
 
     let mut tasks = state
         .get_db()
