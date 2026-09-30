@@ -14,6 +14,7 @@ Check the Table Of Contents to jump to the relevant section.
 
 - [Run hyperswitch using Docker Compose](#run-hyperswitch-using-docker-compose)
   - [Running additional services](#running-additional-services)
+  - [Host port conflicts (Homebrew Redis or PostgreSQL on macOS)](#host-port-conflicts-homebrew-redis-or-postgresql-on-macos)
 - [Set up a development environment using Docker Compose](#set-up-a-development-environment-using-docker-compose)
 - [Set up a Nix development environment](#set-up-a-nix-development-environment)
    - [Install Nix](#install-nix)
@@ -55,6 +56,57 @@ Check the Table Of Contents to jump to the relevant section.
    scripts/setup.sh
    ```
    You will get prompts to select your preferred setup option.
+
+### Host port conflicts (Homebrew Redis or PostgreSQL on macOS)
+
+The Docker Compose files publish PostgreSQL on host port `5432` and Redis on
+host port `6379`.
+If Redis or PostgreSQL is already running on your machine (on macOS, typically
+started with `brew services start redis` or
+`brew services start postgresql@14`), `docker compose up` fails with an error
+like:
+
+```text
+Error response from daemon: driver failed programming external connectivity on endpoint redis:
+Bind for 0.0.0.0:6379 failed: port is already allocated
+```
+
+Depending on the container runtime, the container may instead start while the
+host port keeps pointing at your local Redis or PostgreSQL.
+
+1. Check whether a local service holds the port:
+
+   ```shell
+   brew services list
+   lsof -nP -iTCP:6379 -sTCP:LISTEN
+   lsof -nP -iTCP:5432 -sTCP:LISTEN
+   ```
+
+2. Either stop the local service while you use Docker Compose:
+
+   ```shell
+   brew services stop redis
+   brew services stop postgresql@14
+   ```
+
+3. Or keep it running and publish the containers on different host ports using
+   the `REDIS_HOST_PORT` and `PG_HOST_PORT` environment variables (defaults:
+   `6379` and `5432`):
+
+   ```shell
+   REDIS_HOST_PORT=6380 PG_HOST_PORT=5433 docker compose up -d
+   ```
+
+   They apply to both `docker-compose.yml` and `docker-compose-development.yml`.
+   When running `docker compose` directly, you can also place them in a `.env`
+   file in the project root, which Docker Compose reads automatically.
+   `scripts/setup.sh` passes its own `--env-file`, so Compose does not read
+   `.env` there; export the variables in your shell instead, for example
+   `REDIS_HOST_PORT=6380 PG_HOST_PORT=5433 scripts/setup.sh`.
+   Only the host side changes: the services still reach each other on the
+   container ports, so `config/docker_compose.toml` does not need to be updated.
+   Use the new ports when connecting from your host, for example
+   `redis-cli -p 6380` or `psql -h localhost -p 5433 -U db_user hyperswitch_db`.
 
 [docker-compose-install]: https://docs.docker.com/compose/install/
 [podman-compose-install]: https://podman.io/docs/installation
