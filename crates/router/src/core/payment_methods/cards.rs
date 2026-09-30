@@ -7141,34 +7141,51 @@ pub async fn get_bank_debit_from_hs_locker(
     customer_id: &id_type::CustomerId,
     token_ref: &str,
 ) -> errors::RouterResult<hyperswitch_domain_models::payment_method_data::BankDebitDetail> {
-    let should_trigger_fingerprint_migration =
-        payment_method_utils::get_should_trigger_fingerprint_migration(
-            state,
-            Some(customer_id),
-            provider.get_provider_merchant_id(),
-        )
-        .await;
+    let stored_pm_data = if state.conf.locker.mock_locker {
+        let stored_data = mock_get_payment_method(state, provider.get_key_store(), token_ref)
+            .await
+            .change_context(errors::ApiErrorResponse::InternalServerError)
+            .attach_printable("Failed to fetch bank debit from mock locker")?
+            .payment_method
+            .payment_method_data;
+        let vaulting_data: hyperswitch_domain_models::vault::PaymentMethodVaultingData =
+            stored_data
+                .peek()
+                .parse_struct("PaymentMethodVaultingData")
+                .change_context(errors::ApiErrorResponse::InternalServerError)
+                .attach_printable("Failed to parse bank debit data from mock locker")?;
+        vaulting_data
+    } else {
+        let should_trigger_fingerprint_migration =
+            payment_method_utils::get_should_trigger_fingerprint_migration(
+                state,
+                Some(customer_id),
+                provider.get_provider_merchant_id(),
+            )
+            .await;
 
-    let payload = encode_vault_retrieve_request(
-        should_trigger_fingerprint_migration,
-        provider.get_account().get_id().clone(),
-        customer_id,
-        token_ref,
-    )?;
+        let payload = encode_vault_retrieve_request(
+            should_trigger_fingerprint_migration,
+            provider.get_account().get_id().clone(),
+            customer_id,
+            token_ref,
+        )?;
 
-    let resp = vault::call_to_vault::<pm_types::VaultRetrieve>(state, payload, None, None)
-        .await
-        .change_context(errors::VaultError::VaultAPIError)
-        .attach_printable("Call to vault failed")
-        .change_context(errors::ApiErrorResponse::InternalServerError)?;
+        let resp = vault::call_to_vault::<pm_types::VaultRetrieve>(state, payload, None, None)
+            .await
+            .change_context(errors::VaultError::VaultAPIError)
+            .attach_printable("Call to vault failed")
+            .change_context(errors::ApiErrorResponse::InternalServerError)?;
 
-    let stored_pm_resp: pm_types::VaultRetrieveResponse = resp
-        .parse_struct("VaultRetrieveResponse")
-        .change_context(errors::VaultError::ResponseDeserializationFailed)
-        .attach_printable("Failed to parse data into VaultRetrieveResponse")
-        .change_context(errors::ApiErrorResponse::InternalServerError)?;
+        let stored_pm_resp: pm_types::VaultRetrieveResponse = resp
+            .parse_struct("VaultRetrieveResponse")
+            .change_context(errors::VaultError::ResponseDeserializationFailed)
+            .attach_printable("Failed to parse data into VaultRetrieveResponse")
+            .change_context(errors::ApiErrorResponse::InternalServerError)?;
+        stored_pm_resp.data
+    };
 
-    match stored_pm_resp.data {
+    match stored_pm_data {
         hyperswitch_domain_models::vault::PaymentMethodVaultingData::BankDebit(
             bank_debit_detail,
         ) => Ok(bank_debit_detail),
@@ -7684,5 +7701,38 @@ mod mock_locker_tests {
             Some("encrypted_bank_debit")
         );
         assert_eq!(stored.customer_id, Some(customer_id));
+    }
+
+    #[test]
+    fn bank_debit_vaulting_data_round_trips_through_mock_locker_encoding() {
+        let pmd = hyperswitch_domain_models::vault::PaymentMethodVaultingData::BankDebit(
+            hyperswitch_domain_models::payment_method_data::BankDebitDetail::Ach {
+                account_number: Secret::new("000123456789".to_string()),
+                routing_number: Secret::new("110000000".to_string()),
+                bank_account_holder_name: Some(Secret::new("John Doe".to_string())),
+                bank_type: None,
+                bank_holder_type: None,
+            },
+        );
+        let encoded = pmd
+            .encode_to_string_of_json()
+            .expect("bank debit vaulting data should encode");
+
+        let decoded: hyperswitch_domain_models::vault::PaymentMethodVaultingData = encoded
+            .parse_struct("PaymentMethodVaultingData")
+            .expect("bank debit vaulting data should decode");
+
+        let hyperswitch_domain_models::vault::PaymentMethodVaultingData::BankDebit(
+            hyperswitch_domain_models::payment_method_data::BankDebitDetail::Ach {
+                account_number,
+                routing_number,
+                ..
+            },
+        ) = decoded
+        else {
+            panic!("expected BankDebit vaulting data");
+        };
+        assert_eq!(account_number.peek(), "000123456789");
+        assert_eq!(routing_number.peek(), "110000000");
     }
 }
