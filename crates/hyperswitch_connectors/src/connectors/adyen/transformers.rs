@@ -7294,3 +7294,62 @@ impl
         })
     }
 }
+
+#[cfg(test)]
+mod ach_bank_debit_response_tests {
+    use super::*;
+
+    fn ach_response(result_code: &str) -> serde_json::Value {
+        serde_json::json!({
+            "additionalData": {
+                "bankAccount.ownerName": "John Doe",
+                "bankAccount.bankLocationId": "011000138",
+                "paymentMethod": "ach"
+            },
+            "pspReference": "V4HZ4RBFJGXXGN82",
+            "resultCode": result_code,
+            "amount": { "currency": "USD", "value": 1000 },
+            "merchantReference": "pay_ach_12977",
+            "paymentMethod": { "type": "ach" }
+        })
+    }
+
+    fn transform(result_code: &str) -> AdyenPaymentsResponseData {
+        let response: AdyenPaymentResponse = serde_json::from_value(ach_response(result_code))
+            .expect("Adyen ACH response should deserialize");
+        let AdyenPaymentResponse::Response(response) = response else {
+            panic!("Adyen ACH response should map to AdyenPaymentResponse::Response");
+        };
+        get_adyen_response(
+            *response,
+            false,
+            200,
+            Some(storage_enums::PaymentMethodType::Ach),
+            storage_enums::AttemptStatus::Pending,
+        )
+        .expect("Adyen ACH response should transform without error")
+    }
+
+    #[test]
+    fn ach_received_response_maps_to_pending_with_psp_reference() {
+        let data = transform("Received");
+        assert_eq!(data.status, storage_enums::AttemptStatus::Pending);
+        assert!(data.error.is_none());
+        let PaymentsResponseData::TransactionResponse { resource_id, .. } =
+            data.payments_response_data
+        else {
+            panic!("expected TransactionResponse");
+        };
+        assert!(matches!(
+            resource_id,
+            ResponseId::ConnectorTransactionId(id) if id == "V4HZ4RBFJGXXGN82"
+        ));
+    }
+
+    #[test]
+    fn ach_authorised_response_maps_to_charged() {
+        let data = transform("Authorised");
+        assert_eq!(data.status, storage_enums::AttemptStatus::Charged);
+        assert!(data.error.is_none());
+    }
+}

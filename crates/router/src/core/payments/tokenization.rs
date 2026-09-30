@@ -1465,7 +1465,9 @@ pub async fn save_in_locker_internal(
             ),
         )
         .await
-        .change_context(errors::ApiErrorResponse::InternalServerError)
+        .change_context(errors::ApiErrorResponse::UnprocessableEntity {
+            message: "Unable to save the bank debit payment method".to_string(),
+        })
         .attach_printable("Add Bank Debit Failed"),
         (
             None,
@@ -2256,7 +2258,10 @@ pub async fn save_card_and_network_token_in_locker(
                 business_profile,
             ))
             .await
-            .change_context(errors::ApiErrorResponse::InternalServerError)
+            .map_err(|err| match err.current_context() {
+                errors::ApiErrorResponse::UnprocessableEntity { .. } => err,
+                _ => err.change_context(errors::ApiErrorResponse::InternalServerError),
+            })
             .attach_printable("Add Card In Locker Failed")?;
 
             // Network token generation is deferred to an async background task in save_payment_method()
