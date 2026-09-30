@@ -97,10 +97,12 @@ host port keeps pointing at your local Redis or PostgreSQL.
    REDIS_HOST_PORT=6380 PG_HOST_PORT=5433 docker compose up -d
    ```
 
-   The variables can also be placed in a `.env` file in the project root, which
-   Docker Compose reads automatically.
-   They apply to both `docker-compose.yml` and `docker-compose-development.yml`,
-   and `scripts/setup.sh` checks the configured ports.
+   They apply to both `docker-compose.yml` and `docker-compose-development.yml`.
+   When running `docker compose` directly, you can also place them in a `.env`
+   file in the project root, which Docker Compose reads automatically.
+   `scripts/setup.sh` passes its own `--env-file`, so Compose does not read
+   `.env` there; export the variables in your shell instead, for example
+   `REDIS_HOST_PORT=6380 PG_HOST_PORT=5433 scripts/setup.sh`.
    Only the host side changes: the services still reach each other on the
    container ports, so `config/docker_compose.toml` does not need to be updated.
    Use the new ports when connecting from your host, for example
