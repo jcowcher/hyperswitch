@@ -209,22 +209,27 @@ pub struct Cache {
 /// Per-key async locks used to let only one caller at a time run the fallback for a
 /// missing cache key. Entries are removed once no caller holds or awaits them.
 #[derive(Default)]
-struct KeyedLocks(Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>);
+struct KeyedLocks(Mutex<HashMap<String, KeyedLockEntry>>);
+
+/// The key's lock and the number of callers holding or awaiting it.
+type KeyedLockEntry = (Arc<tokio::sync::Mutex<()>>, usize);
 
 impl KeyedLocks {
     async fn lock(&self, key: String) -> KeyedLockGuard<'_> {
-        let lock = Arc::clone(
-            self.0
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .entry(key.clone())
-                .or_default(),
-        );
-        KeyedLockGuard {
+        let lock = {
+            let mut locks = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let (lock, users) = locks.entry(key.clone()).or_default();
+            *users = users.saturating_add(1);
+            Arc::clone(lock)
+        };
+        // Created before awaiting so that a cancelled waiter still releases its entry.
+        let mut guard = KeyedLockGuard {
             locks: self,
             key,
-            guard: Some(lock.lock_owned().await),
-        }
+            guard: None,
+        };
+        guard.guard = Some(lock.lock_owned().await);
+        guard
     }
 }
 
@@ -236,16 +241,14 @@ struct KeyedLockGuard<'a> {
 
 impl Drop for KeyedLockGuard<'_> {
     fn drop(&mut self) {
-        let mut locks = self.locks.0.lock().unwrap_or_else(PoisonError::into_inner);
-        // One reference is held by the map and one by this guard; any more belong to
-        // callers still waiting on this key.
-        if locks
-            .get(&self.key)
-            .is_some_and(|lock| Arc::strong_count(lock) <= 2)
-        {
-            locks.remove(&self.key);
-        }
         self.guard.take();
+        let mut locks = self.locks.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, users)) = locks.get_mut(&self.key) {
+            *users = users.saturating_sub(1);
+            if *users == 0 {
+                locks.remove(&self.key);
+            }
+        }
     }
 }
 
@@ -627,6 +630,23 @@ where
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn keyed_lock_entry_is_removed_when_waiter_is_cancelled() {
+        let locks = KeyedLocks::default();
+        let leader = locks.lock("key".to_string()).await;
+        let mut waiter = Box::pin(locks.lock("key".to_string()));
+        assert!(futures::poll!(waiter.as_mut()).is_pending());
+
+        drop(leader);
+        drop(waiter);
+
+        assert!(locks
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty());
+    }
 
     #[tokio::test]
     async fn construct_and_get_cache() {
